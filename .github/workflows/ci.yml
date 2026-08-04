@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [feature/ci]
+  workflow_dispatch:
+
+jobs:
+  # =================================================================
+  # Smoke-test the *published* testing binaries on all three
+  # platforms: install INLA the way a user does, run a small model.
+  # Catches broken published builds before users hit them.
+  # =================================================================
+  smoke:
+    name: Smoke test published binary (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install INLA from the testing repository
+        shell: Rscript {0}
+        run: |
+          options(repos = c(INLA = "https://inla.r-inla-download.org/R/testing",
+                            CRAN = "https://cloud.r-project.org"))
+          install.packages("INLA")
+          library(INLA)
+          cat("Installed INLA version:", as.character(inla.version("version")), "\n")
+
+      - name: Run smoke model
+        shell: Rscript {0}
+        run: |
+          library(INLA)
+          inla.setOption(num.threads = "1:1")
+          df <- data.frame(y = c(1, 2, 0, 3, 1, 2, 4, 0, 2, 1),
+                           x = (1:10) / 10, idx = 1:10)
+          r <- inla(y ~ 1 + x + f(idx, model = "iid"),
+                    data = df, family = "poisson")
+          print(r$summary.fixed)
+          cat("mlik:", r$mlik[1, 1], "\n")
+          stopifnot(is.finite(r$mlik[1, 1]))
+          writeLines(sprintf("%s %.6f", "${{ matrix.os }}", r$mlik[1, 1]),
+                     sprintf("mlik-%s.txt", "${{ matrix.os }}"))
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mlik-${{ matrix.os }}
+          path: mlik-*.txt
+
+  # =================================================================
+  # The three platforms must agree on the marginal likelihood of the
+  # smoke model (up to numerical noise across BLAS implementations).
+  # =================================================================
+  compare:
+    name: Cross-platform mlik agreement
+    needs: smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mlik-*
+          merge-multiple: true
+
+      - name: Compare mlik across platforms
+        run: |
+          cat mlik-*.txt
+          awk '{print $2}' mlik-*.txt | sort -g > vals
+          min=$(head -1 vals); max=$(tail -1 vals)
+          awk -v a="$min" -v b="$max" 'BEGIN {
+            d = b - a
+            printf "spread = %.6f\n", d
+            if (d > 0.01) { print "FAIL: mlik disagrees across platforms"; exit 1 }
+            print "OK"
+          }'
+
+  # =================================================================
+  # Run the testthat suite against THIS TREE's R code, using the
+  # binaries from the latest published testing package.
+  # =================================================================
+  r-tests:
+    name: R package testthat (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install dependencies and published INLA (for its binaries)
+        shell: Rscript {0}
+        run: |
+          options(repos = c(INLA = "https://inla.r-inla-download.org/R/testing",
+                            CRAN = "https://cloud.r-project.org"))
+          install.packages(c("testthat", "devtools", "withr", "sn", "sp",
+                             "mvtnorm", "numDeriv", "matrixStats", "Deriv",
+                             "fastGHQuad", "evd"))
+          dir.create("~/inla-bin-lib")
+          install.packages("INLA", lib = "~/inla-bin-lib")
+
+      - name: Install this tree's rinla, grafting the published binaries
+        run: |
+          R CMD INSTALL rinla
+          RLIB=$(Rscript -e 'cat(.libPaths()[1])')
+          cp -a "$HOME/inla-bin-lib/INLA/bin" "$RLIB/INLA/bin"
+          ls "$RLIB/INLA/bin"
+
+      - name: Run testthat suite
+        shell: Rscript {0}
+        run: |
+          library(INLA)
+          cat("R code from this tree, binary:",
+              as.character(inla.version("version")), "\n")
+          testthat::test_dir("rinla/tests/testthat",
+                             package = "INLA",
+                             stop_on_failure = TRUE)
+
+  # =================================================================
+  # Compile GMRFLib (incl. bundled TAUCS) and the inla program with
+  # the MinGW UCRT toolchain -- the same target as the maintainer's
+  # Linux->Windows cross build. Catches Windows-only breakage like
+  # the Rinterface.h episode (commits 72967f753..cbb5defdc).
+  # Linking is skipped for now (LD=true): compile errors are the
+  # signal we are after.
+  # =================================================================
+  windows-compile:
+    name: Windows compile check (MSYS2 UCRT64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Use LF line endings
+        run: git config --global core.autocrlf input
+        shell: pwsh
+
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            make
+            tar
+            diffutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gcc-fortran
+            mingw-w64-ucrt-x86_64-gsl
+            mingw-w64-ucrt-x86_64-openblas
+            mingw-w64-ucrt-x86_64-metis
+            mingw-w64-ucrt-x86_64-muparser
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-suitesparse
+
+      - uses: r-lib/actions/setup-r@v2
+
+      - name: Locate R headers
+        shell: pwsh
+        run: |
+          $rh = Rscript -e "cat(R.home())"
+          echo "R_HOME_WIN=$rh" >> $env:GITHUB_ENV
+
+      - name: Build GMRFLib (includes bundled TAUCS)
+        run: |
+          mkdir -p local/include local/lib
+          make -C gmrflib -k -j4 \
+            PREFIX="$PWD/local" \
+            LEXTPREFIX="$MINGW_PREFIX" \
+            IEXTLIBS="-I$MINGW_PREFIX/include -I$MINGW_PREFIX/include/suitesparse" \
+            FLAGS="-Wall -g -O1 -fopenmp -pthread -DWINDOWS -DOSTYPE_win32"
+          make -C gmrflib install \
+            PREFIX="$PWD/local" \
+            LEXTPREFIX="$MINGW_PREFIX" \
+            FLAGS="-Wall -g -O1 -fopenmp -pthread -DWINDOWS -DOSTYPE_win32"
+
+      - name: Compile inla program (objects only, link skipped)
+        run: |
+          RH=$(cygpath -u "$R_HOME_WIN")
+          make -C inlaprog -k inla \
+            LD=true \
+            PREFIX="$PWD/local" \
+            LEXTPREFIX="$MINGW_PREFIX" \
+            RLIB_INC="-DINLA_WITH_LIBR -I$RH/include" \
+            RLIB_LIB="" \
+            FLAGS="-std=gnu99 -O1 -fopenmp -pipe -DWINDOWS -DOSTYPE_win32"
