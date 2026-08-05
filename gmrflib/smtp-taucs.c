@@ -18,6 +18,8 @@
 // }
 //      GMRFLib_taucs_ctl_tp;
 
+int GMRFLib_qinv_keep_fill = 0;				       /* see GMRFLib_compute_Qinv_TAUCS_compute() */
+
 static GMRFLib_taucs_ctl_tp taucs_ctl = {
 	.min_block_size = 4,
 	.block_size = 64
@@ -1475,12 +1477,10 @@ int GMRFLib_compute_Qinv_TAUCS_compute(GMRFLib_problem_tp *problem, taucs_ccs_ma
 	}
 
 	// its good to remove as then we do not need to correct that many for constraints.
-	// keeping the fill-entries instead (env INLA_QINV_KEEP_FILL) makes the whole
-	// L-pattern available to Qinv_get, which the gcpo lookup-path needs
-	static int keep_fill = -1;
-	if (keep_fill < 0) {
-		keep_fill = (getenv("INLA_QINV_KEEP_FILL") != NULL);
-	}
+	// keeping the fill-entries instead makes the whole L-pattern available to
+	// Qinv_get, which the gcpo lookup-path needs: auto-enabled from ai when gcpo
+	// is on (GMRFLib_qinv_keep_fill), or forced with env INLA_QINV_KEEP_FILL
+	int keep_fill = GMRFLib_qinv_keep_fill || (getenv("INLA_QINV_KEEP_FILL") != NULL);
 	if (!keep_fill) {
 		int *rremove = nnbsQ;
 		GMRFLib_ifill(n, 0, rremove);

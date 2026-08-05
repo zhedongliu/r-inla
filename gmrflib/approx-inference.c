@@ -1214,6 +1214,9 @@ int GMRFLib_ai_INLA_experimental(GMRFLib_density_tp ***density,
 	x_mode = Calloc(graph->n, double);
 
 	if (gcpo) {
+		// let the Qinv store keep the L-fill entries so the gcpo lookup-path
+		// can serve pairs beyond the Q-graph neighbours
+		GMRFLib_qinv_keep_fill = 1;
 		(*gcpo) = Calloc(1, GMRFLib_gcpo_tp);
 		(*gcpo)->n = preopt->Npred;
 		(*gcpo)->value = Calloc(preopt->Npred, double);
@@ -3956,12 +3959,12 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 		GMRFLib_openmp_implement_strategy_special(nt_inner, nt_outer);
 	}
 
-	// pattern-lookup path (prototype, env INLA_GCPO_LOOKUP): the partial inverse on
-	// the Q-pattern is already in the ai_store (and is constraint-corrected), so a
-	// pair-covariance whose A-row supports are mutual neighbours is a plain lookup:
+	// pattern-lookup path: the partial inverse on the Q-pattern is already in the
+	// ai_store (and is constraint-corrected), so a pair-covariance whose A-row
+	// supports are mutual neighbours is a plain lookup:
 	// cov(i,j) = sum_kl a_ik a_jl Qinv[k,l]. pairs that touch a removed/off-pattern
 	// (k,l) fall through to the solve-based paths below with a reduced node list.
-	int use_lookup = (getenv("INLA_GCPO_LOOKUP") != NULL);
+	int use_lookup = (GMRFLib_smtp == GMRFLib_SMTP_TAUCS);
 	if (use_lookup && node_idx) {
 		int lk_timing = (getenv("INLA_GCPO_TIMING") != NULL);
 		double lk_tref = (lk_timing ? GMRFLib_timer() : 0.0);
@@ -3984,7 +3987,9 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 				gsl_matrix_set(mat, ii, ii, lpred_variance[node]);
 				if (jj != ii) {
 					GMRFLib_idxval_tp *vb = A_idx(nnode);
-					int ok = 1;
+					// wide supports make the lookup quadratic and the hits
+					// unlikely: send those pairs to the solve paths instead
+					int ok = ((long) va->n * (long) vb->n <= 64L);
 					double sum = 0.0;
 					for (int ka = 0; ka < va->n && ok; ka++) {
 						for (int kb = 0; kb < vb->n; kb++) {
@@ -4030,12 +4035,12 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 		node_idx = fb;
 	}
 
-	// Gram/half-solve path (prototype, env INLA_GCPO_GRAM): with Q = LL^T we have
+	// Gram/half-solve path: with Q = LL^T we have
 	// cov(eta_i, eta_j) = (L^-1 A_i^T) . (L^-1 A_j^T), so forward-solves are enough:
 	// compute w = L^-1 A^T for every node appearing in a missing-pair (in the mapped
 	// ordering, where the dot-products are invariant), then fill the cov-matrices
-	// with sparse dots of the half-solved columns. constraints not yet supported.
-	int use_gram = (getenv("INLA_GCPO_GRAM") != NULL) && (GMRFLib_smtp == GMRFLib_SMTP_TAUCS);
+	// with sparse dots of the half-solved columns. constraints are corrected below.
+	int use_gram = (GMRFLib_smtp == GMRFLib_SMTP_TAUCS);
 
 	if (!node_idx) {
 		// every node was a skip: nothing to solve for
