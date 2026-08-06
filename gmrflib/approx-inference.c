@@ -3492,6 +3492,160 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		assert(build_ai_store != NULL);
 
 		groups = GMRFLib_idxval_ncreate_x(Npred, 1 + 2 * IABS(gcpo_param->num_level_sets), IMIN(2, GMRFLib_MAX_THREADS()));
+
+		// radius-lookup build (experimental; INLA_GCPO_BUILD_RADIUS=r>0): collect the
+		// candidate data-nodes whose A-support lies within latent BFS radius r of each
+		// data-node's A-support, and demand their support-product pairs into the
+		// Qinv-store computed just below (which is computed anyway for the sd's: no
+		// extra Takahashi pass). group formation then reads the correlations from the
+		// store; a node whose group cannot be concluded inside the radius falls back
+		// to the solve-loop. INLA_GCPO_BUILD_AB=1 runs both paths and compares.
+		int build_radius = 0;
+		GMRFLib_idx_tp **cand = NULL;
+		if (getenv("INLA_GCPO_BUILD_RADIUS") && GMRFLib_smtp == GMRFLib_SMTP_TAUCS && !(gcpo_param->friends)
+		    && gcpo_param->num_level_sets != -1 && d_idx) {
+			build_radius = atoi(getenv("INLA_GCPO_BUILD_RADIUS"));
+		}
+		if (build_radius > 0) {
+			double rb_tref = GMRFLib_timer();
+			GMRFLib_graph_tp *lg = build_ai_store->problem->sub_graph;
+			int nlatent = lg->n;
+			GMRFLib_idx_tp **touch = Calloc(nlatent, GMRFLib_idx_tp *);
+			for (int k = 0; k < d_idx->n; k++) {
+				int node = d_idx->idx[k];
+				GMRFLib_idxval_tp *va = A_idx(node);
+				for (int ka = 0; ka < va->n; ka++) {
+					GMRFLib_idx_add(&(touch[va->idx[ka]]), node);
+				}
+			}
+			// 'global' latents (intercept, fixed effects) sit in nearly every
+			// A-support: letting the BFS pass through them makes everything a
+			// 1-hop neighbour of everything. they can be reached (and their
+			// Qinv-pairs are demanded below) but they do not expand and do not
+			// contribute candidates
+			int rb_hub_lim = IMAX(64, d_idx->n / 100);
+			char *rb_hub = Calloc(nlatent, char);
+			for (int a = 0; a < nlatent; a++) {
+				rb_hub[a] = (touch[a] && touch[a]->n > rb_hub_lim);
+			}
+			cand = Calloc(Npred, GMRFLib_idx_tp *);
+			GMRFLib_idx_tp **rb_kp = Calloc(nlatent, GMRFLib_idx_tp *);
+			int *rb_dist = Malloc(nlatent, int);
+			int *rb_stack = Malloc(nlatent, int);
+			for (int i = 0; i < nlatent; i++) {
+				rb_dist[i] = -1;
+			}
+			size_t rb_kp_n = 0;
+			for (int k = 0; k < d_idx->n; k++) {
+				int node = d_idx->idx[k];
+				GMRFLib_idxval_tp *va = A_idx(node);
+				int ns = 0;
+				for (int ka = 0; ka < va->n; ka++) {
+					int a = va->idx[ka];
+					if (rb_dist[a] < 0) {
+						rb_dist[a] = 0;
+						rb_stack[ns++] = a;
+					}
+				}
+				int lo = 0, hi = ns, ns_inner = ns;
+				int rd = (build_radius + 1) / 2;       /* demand-closure radius */
+				for (int r = 1; r <= build_radius; r++) {
+					for (int t = lo; t < hi; t++) {
+						int a = rb_stack[t];
+						if (rb_hub[a]) {
+							continue;      /* reachable, but does not expand */
+						}
+						for (int kk = 0; kk < lg->nnbs[a]; kk++) {
+							int b = lg->nbs[a][kk];
+							if (rb_dist[b] < 0) {
+								rb_dist[b] = r;
+								rb_stack[ns++] = b;
+							}
+						}
+					}
+					lo = hi;
+					hi = ns;
+					if (r == rd) {
+						ns_inner = ns;
+					}
+				}
+				for (int t = 0; t < ns; t++) {
+					int a = rb_stack[t];
+					GMRFLib_idx_tp *tc = touch[a];
+					if (tc && !rb_hub[a]) {
+						GMRFLib_idx_nadd(&(cand[node]), tc->n, tc->idx);
+					}
+				}
+				// Qinv-demands (with the exact out-of-fill closure) only for the
+				// INNER candidates: the outer ring exists to witness the next
+				// level and to catch stragglers; its rare fill-misses read as 0
+				GMRFLib_idx_tp *inner = NULL;
+				for (int t = 0; t < ns_inner; t++) {
+					int a = rb_stack[t];
+					GMRFLib_idx_tp *tc = touch[a];
+					if (tc && !rb_hub[a]) {
+						GMRFLib_idx_nadd(&inner, tc->n, tc->idx);
+					}
+				}
+				for (int t = 0; t < ns; t++) {
+					rb_dist[rb_stack[t]] = -1;
+				}
+				if (cand[node]) {
+					GMRFLib_idx_sort(cand[node]);
+					GMRFLib_idx_uniq(cand[node]);
+				}
+				if (inner) {
+					GMRFLib_idx_sort(inner);
+					GMRFLib_idx_uniq(inner);
+					for (int c = 0; c < inner->n; c++) {
+						int nnode = inner->idx[c];
+						if (nnode <= node) {
+							continue;
+						}
+						GMRFLib_idxval_tp *vb = A_idx(nnode);
+						for (int ka = 0; ka < va->n; ka++) {
+							for (int kb = 0; kb < vb->n; kb++) {
+								int a = va->idx[ka];
+								int b = vb->idx[kb];
+								if (a != b) {
+									GMRFLib_idx_add(&(rb_kp[IMIN(a, b)]), IMAX(a, b));
+								}
+							}
+						}
+					}
+					GMRFLib_idx_free(inner);
+				}
+			}
+			for (int i = 0; i < nlatent; i++) {
+				if (rb_kp[i]) {
+					GMRFLib_idx_sort(rb_kp[i]);
+					GMRFLib_idx_uniq(rb_kp[i]);
+					rb_kp_n += (size_t) rb_kp[i]->n;
+				}
+			}
+			if (GMRFLib_qinv_keep_pairs) {
+				for (int i = 0; i < GMRFLib_qinv_keep_pairs_n; i++) {
+					GMRFLib_idx_free(GMRFLib_qinv_keep_pairs[i]);
+				}
+				Free(GMRFLib_qinv_keep_pairs);
+			}
+			GMRFLib_qinv_keep_pairs = rb_kp;
+			GMRFLib_qinv_keep_pairs_n = nlatent;
+			// force the store below to be (re)computed with these pairs kept
+			GMRFLib_free_Qinv(build_ai_store->problem);
+			for (int i = 0; i < nlatent; i++) {
+				GMRFLib_idx_free(touch[i]);
+			}
+			Free(touch);
+			Free(rb_hub);
+			Free(rb_dist);
+			Free(rb_stack);
+			if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
+				printf("[gcpo-timing] build: radius-%1d candidates+demands %.4f s (%zu latent pairs beyond the Q-graph)\n",
+				       build_radius, GMRFLib_timer() - rb_tref, rb_kp_n);
+			}
+		}
+
 		GMRFLib_ai_add_Qinv_to_ai_store(ai_store);
 		GMRFLib_ai_add_Qinv_to_ai_store(build_ai_store);
 
@@ -3553,7 +3707,173 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		for (int i = 0; i < nt_outer; i++) {
 			Swork[i] = Malloc(n * nrhs, double);
 		}
-		GMRFLib_ptr_tp *split = GMRFLib_idx_split(selection, nrhs);
+		// radius-lookup group formation: same level-selection as the solve-loop
+		// below, but the correlations come from Qinv lookups over the radius
+		// candidates. any exit that would need to look beyond the candidates, and
+		// any Qinv lookup-miss, sends the node to the solve-loop instead.
+		int build_ab = (build_radius > 0 && getenv("INLA_GCPO_BUILD_AB") != NULL);
+		GMRFLib_idx_tp *solve_sel = selection;
+		GMRFLib_idx_tp *fb_sel = NULL;
+		GMRFLib_idxval_tp **groups_rb = NULL;
+		if (build_radius > 0) {
+			double rb_tref = GMRFLib_timer();
+			GMRFLib_problem_tp *rb_pb = build_ai_store->problem;
+			GMRFLib_idx_tp **fbl = Calloc(nt_outer, GMRFLib_idx_tp *);
+			size_t rb_ok = 0, rb_pmiss = 0, rb_nmiss = 0;
+
+#pragma omp parallel for num_threads(nt_outer) schedule(dynamic, 64) reduction(+: rb_ok, rb_pmiss, rb_nmiss)
+			for (int is = 0; is < selection->n; is++) {
+				int node = selection->idx[is];
+				int tnum = omp_get_thread_num();
+				GMRFLib_idx_tp *cd = cand[node];
+				int ncand = (cd ? cd->n : 0);
+				int ok = (ncand > 0);
+				double *cor = (ok ? Malloc(2 * ncand, double) : NULL);
+				double *cor_abs = (ok ? cor + ncand : NULL);
+				size_t *largest = (ok ? Malloc(ncand, size_t) : NULL);
+				GMRFLib_idxval_tp *va = A_idx(node);
+				size_t node_miss = 0;
+
+				for (int c = 0; c < ncand && ok; c++) {
+					int nnode = cd->idx[c];
+					if (nnode == node) {
+						cor[c] = cor_abs[c] = 1.0;
+						continue;
+					}
+					GMRFLib_idxval_tp *vb = A_idx(nnode);
+					double sum = 0.0;
+					int hit = 1;
+					for (int ka = 0; ka < va->n && hit; ka++) {
+						for (int kb = 0; kb < vb->n; kb++) {
+							double *q = GMRFLib_Qinv_get(rb_pb, va->idx[ka], vb->idx[kb]);
+							if (!q) {
+								hit = 0;
+								break;
+							}
+							sum += va->val[ka] * vb->val[kb] * (*q);
+						}
+					}
+					if (hit) {
+						sum *= isd[node] * isd[nnode];
+						cor[c] = TRUNCATE(sum, -1.0, 1.0);
+						cor_abs[c] = ABS(cor[c]);
+					} else {
+						// pair beyond the factorization fill: treated as
+						// negligible (the far-pair slot the radius
+						// certificate will cover rigorously; A/B-validated
+						// meanwhile). it can still serve as a next-level
+						// witness since it sorts last.
+						cor[c] = cor_abs[c] = 0.0;
+						node_miss++;
+					}
+				}
+				rb_pmiss += node_miss;
+				rb_nmiss += (node_miss > 0);
+
+				if (ok) {
+					int levels_ok = 0, exhausted = 0;
+					double levels_magnify = 1.0;
+					while (!levels_ok && !exhausted) {
+						groups[node]->n = 0;
+						int siz_g = IMIN(ncand, (int) (levels_magnify * (IABS(gcpo_param->num_level_sets) + 4L)));
+						int capped = (siz_g == ncand);
+						levels_magnify *= 4.0;
+						gsl_sort_largest_index(largest, (size_t) siz_g, cor_abs, (size_t) 1, (size_t) ncand);
+
+						double sumw = W(node);
+						double cor_abs_prev = 1.0;
+						int i_prev = cd->idx[(int) largest[0]];
+						GMRFLib_idxval_add(&(groups[node]), i_prev, cor_abs_prev);
+						for (int i = 1; i < siz_g && !levels_ok; i++) {
+							int i_new_l = (int) largest[i];
+							int i_new = cd->idx[i_new_l];
+							double cor_abs_new = cor_abs[i_new_l];
+							if (LEGAL_TO_ADD(i_new)) {
+								if (!GMRFLib_equal_cor(cor_abs_new, cor_abs_prev, gcpo_param)) {
+									if ((sumw >= IABS(gcpo_param->num_level_sets))) {
+										levels_ok = 1;
+									} else {
+										sumw += W(i_new);
+										i_prev = i_new;
+										cor_abs_prev = cor_abs_new;
+										GMRFLib_idxval_add(&(groups[node]), i_new, cor[i_new_l]);
+									}
+								} else {
+									cor_abs[i_new_l] = cor_abs_prev;
+									cor[i_new_l] = DSIGN(cor[i_new_l]) * cor_abs_prev;
+									GMRFLib_idxval_add(&(groups[node]), i_new, cor[i_new_l]);
+									if (W(i_new) > W(i_prev)) {
+										sumw += W(i_new) - W(i_prev);
+										i_prev = i_new;
+									}
+								}
+							}
+						}
+						if (!levels_ok) {
+							if ((sumw > IABS(gcpo_param->num_level_sets)) ||
+							    (gcpo_param->size_max > 0 && groups[node]->n >= gcpo_param->size_max)) {
+								levels_ok = 1;
+							} else if (capped) {
+								// would need candidates beyond the radius: cannot conclude
+								exhausted = 1;
+							}
+						}
+					}
+					if (levels_ok) {
+						GMRFLib_idxval_nsort_x(&(groups[node]), 1, 1, 0, 0);
+						if (GMRFLib_iwhich_sorted(node, groups[node]->idx, (unsigned int) groups[node]->n) < 0) {
+							GMRFLib_idxval_add(&(groups[node]), node, 1.0);
+							GMRFLib_idxval_nsort_x(&(groups[node]), 1, 1, 0, 0);
+						}
+						rb_ok++;
+					} else {
+						ok = 0;
+					}
+				}
+				if (!ok) {
+					if (groups[node]) {
+						groups[node]->n = 0;
+					}
+					GMRFLib_idx_add(&(fbl[tnum]), node);
+				}
+				Free(cor);
+				Free(largest);
+			}
+
+			for (int t = 0; t < nt_outer; t++) {
+				if (fbl[t]) {
+					GMRFLib_idx_nadd(&fb_sel, fbl[t]->n, fbl[t]->idx);
+					GMRFLib_idx_free(fbl[t]);
+				}
+			}
+			Free(fbl);
+			if (!fb_sel) {
+				GMRFLib_idx_create_x(&fb_sel, 1);      /* empty */
+			}
+			solve_sel = fb_sel;
+			if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
+				printf("[gcpo-timing] build: radius-lookup groups %.4f s (%zu of %1d nodes concluded, %1d to solve-fallback; "
+				       "%zu fill-miss pairs on %zu nodes)\n",
+				       GMRFLib_timer() - rb_tref, rb_ok, selection->n, fb_sel->n, rb_pmiss, rb_nmiss);
+			}
+			if (build_ab) {
+				// save the radius groups and let the solve-loop redo ALL nodes
+				groups_rb = Calloc(Npred, GMRFLib_idxval_tp *);
+				for (int is = 0; is < selection->n; is++) {
+					int node = selection->idx[is];
+					if (groups[node] && groups[node]->n > 0) {
+						GMRFLib_idxval_create_x(&(groups_rb[node]), groups[node]->n);
+						for (int i = 0; i < groups[node]->n; i++) {
+							GMRFLib_idxval_add(&(groups_rb[node]), groups[node]->idx[i], groups[node]->val[i]);
+						}
+					}
+					groups[node]->n = 0;
+				}
+				solve_sel = selection;
+			}
+		}
+
+		GMRFLib_ptr_tp *split = GMRFLib_idx_split(solve_sel, nrhs);
 
 		if (GMRFLib_smtp == GMRFLib_SMTP_STILES) {
 			// ...and deal with unbind manually
@@ -3564,7 +3884,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		double gcpo_tref = (gcpo_timing ? GMRFLib_timer() : 0.0);
 
 #pragma omp parallel for num_threads(nt_outer)
-		for (int kk = 0; kk < split->n; kk++) {
+		for (int kk = 0; kk < (split ? split->n : 0); kk++) {
 			GMRFLib_idx_tp *sel = (GMRFLib_idx_tp *) split->ptr[kk];
 
 			GMRFLib_stiles_idx_tp stiles_idx = { GMRFLib_stiles_rescale_group(), -1, sel->n };
@@ -3745,14 +4065,52 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		}
 		if (gcpo_timing) {
 			printf("[gcpo-timing] build: solve+group loop %.4f s for %1d columns (nrhs %1d, nt_outer %1d)\n",
-			       GMRFLib_timer() - gcpo_tref, selection->n, nrhs, nt_outer);
+			       GMRFLib_timer() - gcpo_tref, solve_sel->n, nrhs, nt_outer);
 		}
 		if (GMRFLib_smtp == GMRFLib_SMTP_STILES) {
 			// this wil also do unbind
 			GMRFLib_stiles_rescale_end();
 		}
 
-		GMRFLib_idx_split_free(split);
+		if (split) {
+			GMRFLib_idx_split_free(split);
+		}
+
+		if (build_radius > 0) {
+			if (build_ab && groups_rb) {
+				size_t rb_cmp = 0, rb_mismatch = 0;
+				for (int is = 0; is < selection->n; is++) {
+					int node = selection->idx[is];
+					GMRFLib_idxval_tp *g_rb = groups_rb[node];
+					if (!(g_rb && g_rb->n > 0)) {
+						continue;      /* radius path fell back: nothing to compare */
+					}
+					rb_cmp++;
+					GMRFLib_idxval_tp *g_ref = groups[node];
+					int eq = (g_rb->n == g_ref->n);
+					for (int i = 0; eq && i < g_rb->n; i++) {
+						eq = (g_rb->idx[i] == g_ref->idx[i]);
+					}
+					if (!eq) {
+						rb_mismatch++;
+						if (rb_mismatch <= 10) {
+							printf("[gcpo-timing] build: A/B MISMATCH node %1d: radius(n=%1d) vs solve(n=%1d)\n",
+							       node, g_rb->n, g_ref->n);
+						}
+					}
+				}
+				printf("[gcpo-timing] build: A/B compare %zu concluded nodes: %zu group-mismatches\n", rb_cmp, rb_mismatch);
+				for (int i = 0; i < Npred; i++) {
+					GMRFLib_idxval_free(groups_rb[i]);
+				}
+				Free(groups_rb);
+			}
+			for (int i = 0; i < Npred; i++) {
+				GMRFLib_idx_free(cand[i]);
+			}
+			Free(cand);
+			GMRFLib_idx_free(fb_sel);	       /* solve_sel is not used past this point */
+		}
 
 		for (int i = 0; i < nt_outer; i++) {
 			for (int j = 0; j < work_n; j++) {
@@ -3853,6 +4211,12 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 				GMRFLib_idx_uniq(kp[i]);
 				kp_n += (size_t) kp[i]->n;
 			}
+		}
+		if (GMRFLib_qinv_keep_pairs) {		       /* e.g. the radius-build demand-set */
+			for (int i = 0; i < GMRFLib_qinv_keep_pairs_n; i++) {
+				GMRFLib_idx_free(GMRFLib_qinv_keep_pairs[i]);
+			}
+			Free(GMRFLib_qinv_keep_pairs);
 		}
 		GMRFLib_qinv_keep_pairs = kp;
 		GMRFLib_qinv_keep_pairs_n = nlatent;
