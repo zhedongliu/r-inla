@@ -1448,6 +1448,88 @@ int GMRFLib_compute_Qinv_TAUCS_compute(GMRFLib_problem_tp *problem, taucs_ccs_ma
 	RUN_CODE_BLOCK(IMIN(2, GMRFLib_OPENMP_NUM_THREADS_LEVEL()), 0, 0);
 #undef CODE_BLOCK
 
+	// demand-closure: entries demanded via GMRFLib_qinv_keep_pairs that lie
+	// OUTSIDE the factorization fill are computed as well. the Takahashi
+	// recurrence for (i,j) [i <= j, remapped] needs (k,j) or (j,k) for every
+	// k in the below-diagonal pattern of L-column i; closing the demanded set
+	// under this dependency (min-index strictly increases, so it terminates)
+	// makes the recurrence exact for every demanded pair. ex[j] holds the extra
+	// rows i to process in column j's sweep.
+	GMRFLib_idx_tp **ex = NULL;
+	if (GMRFLib_qinv_keep_pairs) {
+		double ex_tref = GMRFLib_timer();
+		int *remap = problem->sub_sm_fact.remap;
+		GMRFLib_idx_tp *stack_i = NULL, *stack_j = NULL;
+		map_ii **exm = Calloc(n, map_ii *);
+		ex = Calloc(n, GMRFLib_idx_tp *);
+
+#define IN_FILL(i_, j_) (GMRFLib_iwhich_sorted(i_, nbs[j_], (unsigned int) nnbs[j_]) >= 0)
+#define ADD_PAIR(i_, j_)						\
+		if (!IN_FILL(i_, j_)) {					\
+			if (!exm[j_]) {					\
+				exm[j_] = Calloc(1, map_ii);		\
+				map_ii_init(exm[j_]);			\
+			}						\
+			if (!map_ii_haskey(exm[j_], i_)) {		\
+				map_ii_set(exm[j_], i_, 1);		\
+				GMRFLib_idx_add(&stack_i, i_);		\
+				GMRFLib_idx_add(&stack_j, j_);		\
+			}						\
+		}
+
+		for (int a = 0; a < IMIN(n, GMRFLib_qinv_keep_pairs_n); a++) {
+			GMRFLib_idx_tp *kp = GMRFLib_qinv_keep_pairs[a];
+			if (!kp) {
+				continue;
+			}
+			for (int k = 0; k < kp->n; k++) {
+				int b = kp->idx[k];
+				int i = remap[a];
+				int j = remap[b];
+				if (i > j) {
+					int tmp = i;
+					i = j;
+					j = tmp;
+				}
+				ADD_PAIR(i, j);
+			}
+		}
+		while (stack_i && stack_i->n > 0) {
+			int i = stack_i->idx[--stack_i->n];
+			int j = stack_j->idx[--stack_j->n];
+			for (int kp = L->colptr[i] + 1; kp < L->colptr[i + 1]; kp++) {
+				int k = L->rowind[kp];
+				if (k == j) {
+					continue;
+				}
+				int pi = IMIN(k, j);
+				int pj = IMAX(k, j);
+				ADD_PAIR(pi, pj);
+			}
+		}
+#undef IN_FILL
+#undef ADD_PAIR
+		size_t ex_n = 0;
+		for (int j = 0; j < n; j++) {
+			if (exm[j]) {
+				for (mapkit_size_t k = -1; (k = map_ii_next(exm[j], k)) != -1;) {
+					GMRFLib_idx_add(&(ex[j]), exm[j]->contents[k].key);
+				}
+				GMRFLib_idx_sort(ex[j]);
+				ex_n += (size_t) ex[j]->n;
+				map_ii_free(exm[j]);
+				Free(exm[j]);
+			}
+		}
+		Free(exm);
+		GMRFLib_idx_free(stack_i);
+		GMRFLib_idx_free(stack_j);
+		if (getenv("INLA_GCPO_TIMING")) {
+			printf("[gcpo-timing] Qinv: demand-closure %.4f s (%zu entries beyond the fill)\n",
+			       GMRFLib_timer() - ex_tref, ex_n);
+		}
+	}
+
 	double *Zj = Calloc(n, double);
 	double *d = L->values;
 	for (int j = n - 1; j >= 0; j--) {
@@ -1458,8 +1540,20 @@ int GMRFLib_compute_Qinv_TAUCS_compute(GMRFLib_problem_tp *problem, taucs_ccs_ma
 			Zj[jj] = q->contents[k].value;
 		}
 
-		for (int ii = nnbs[j] - 1; ii >= 0; ii--) {
-			int i = nbs[j][ii];
+		// merged descending sweep over the fill rows and the demand-closure
+		// rows: descending order guarantees every dependency k > i is done
+		int ia = nnbs[j] - 1;
+		int ib = (ex && ex[j] ? ex[j]->n - 1 : -1);
+		while (ia >= 0 || ib >= 0) {
+			int i;
+			if (ia >= 0 && (ib < 0 || nbs[j][ia] >= ex[j]->idx[ib])) {
+				i = nbs[j][ia--];
+				if (ib >= 0 && ex[j]->idx[ib] == i) {
+					ib--;		       /* duplicate, should not happen */
+				}
+			} else {
+				i = ex[j]->idx[ib--];
+			}
 			int nn = L->colptr[i + 1] - (L->colptr[i] + 1);
 			int kk = L->colptr[i] + 1;
 			double diag = L->values[L->colptr[i]];
@@ -1471,7 +1565,14 @@ int GMRFLib_compute_Qinv_TAUCS_compute(GMRFLib_problem_tp *problem, taucs_ccs_ma
 		}
 	}
 
-	// compute the mapping 
+	if (ex) {
+		for (int j = 0; j < n; j++) {
+			GMRFLib_idx_free(ex[j]);
+		}
+		Free(ex);
+	}
+
+	// compute the mapping
 	inv_remap = Malloc(n, int);
 	for (int k = 0; k < n; k++) {
 		inv_remap[problem->sub_sm_fact.remap[k]] = k;
