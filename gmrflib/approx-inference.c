@@ -4013,20 +4013,19 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 	// ai_store (and is constraint-corrected), so a pair-covariance whose A-row
 	// supports are mutual neighbours is a plain lookup:
 	// cov(i,j) = sum_kl a_ik a_jl Qinv[k,l]. pairs that touch a removed/off-pattern
-	// (k,l) fall through to the solve-based paths below with a reduced node list.
+	// (k,l) fall through to the solve-based paths below, pair by pair
 	int use_lookup = (GMRFLib_smtp == GMRFLib_SMTP_TAUCS);
+	GMRFLib_idx2_tp *pair_fb = NULL;		       /* missed (node, k-of-missing[node]) pairs */
 	if (use_lookup && node_idx) {
 		int lk_timing = (getenv("INLA_GCPO_TIMING") != NULL);
 		double lk_tref = (lk_timing ? GMRFLib_timer() : 0.0);
 		GMRFLib_ai_add_Qinv_to_ai_store(ai_store_id);  /* no-op if its already there */
 		GMRFLib_problem_tp *pb = ai_store_id->problem;
-		unsigned char *redo = Calloc(Npred, unsigned char);
 		size_t nhit = 0, nmiss = 0;
 
 		for (int i = 0; i < node_idx->n; i++) {
 			int node = node_idx->idx[i];
 			GMRFLib_idxval_tp *va = A_idx(node);
-			int node_all_ok = 1;
 			for (int k = 0; k < groups->missing[node]->n; k++) {
 				int nnode = groups->missing[node]->idx[0][k];
 				int cm_idx = groups->missing[node]->idx[1][k];
@@ -4061,39 +4060,29 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 						gsl_matrix_set(mat, jj, ii, cov);
 					} else {
 						nmiss++;
-						node_all_ok = 0;
+						GMRFLib_idx2_add(&pair_fb, node, k);
 					}
 				}
 			}
-			if (!node_all_ok) {
-				redo[node] = 1;
-			}
 		}
 
-		GMRFLib_idx_tp *fb = NULL;
-		for (int i = 0; i < node_idx->n; i++) {
-			if (redo[node_idx->idx[i]]) {
-				GMRFLib_idx_add(&fb, node_idx->idx[i]);
-			}
-		}
 		if (lk_timing) {
-			printf("[gcpo-timing] gcpo: LOOKUP %.4f s (%zu pair-hits, %zu pair-misses, %1d of %1d nodes to fallback)\n",
-			       GMRFLib_timer() - lk_tref, nhit, nmiss, (fb ? fb->n : 0), node_idx->n);
+			printf("[gcpo-timing] gcpo: LOOKUP %.4f s (%zu pair-hits, %zu pair-misses to fallback)\n",
+			       GMRFLib_timer() - lk_tref, nhit, nmiss);
 		}
-		Free(redo);
 		GMRFLib_idx_free(node_idx);
-		node_idx = fb;
+		node_idx = NULL;
 	}
 
 	// Gram/half-solve path: with Q = LL^T we have
 	// cov(eta_i, eta_j) = (L^-1 A_i^T) . (L^-1 A_j^T), so forward-solves are enough:
-	// compute w = L^-1 A^T for every node appearing in a missing-pair (in the mapped
+	// compute w = L^-1 A^T for every node appearing in a missed pair (in the mapped
 	// ordering, where the dot-products are invariant), then fill the cov-matrices
 	// with sparse dots of the half-solved columns. constraints are corrected below.
 	int use_gram = (GMRFLib_smtp == GMRFLib_SMTP_TAUCS);
 
-	if (!node_idx) {
-		// every node was a skip: nothing to solve for
+	if (!node_idx && !pair_fb) {
+		// nothing left to solve for: every pair was a lookup-hit, or every node a skip
 	} else if (use_gram) {
 		int gcpo_timing = (getenv("INLA_GCPO_TIMING") != NULL);
 		double gcpo_tref = (gcpo_timing ? GMRFLib_timer() : 0.0);
@@ -4101,12 +4090,11 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 		assert(pb->sub_graph->n == nn);
 
 		unsigned char *needw = Calloc(Npred, unsigned char);
-		for (int i = 0; i < node_idx->n; i++) {
-			int node = node_idx->idx[i];
+		for (int i = 0; i < pair_fb->n; i++) {
+			int node = pair_fb->idx[0][i];
+			int k = pair_fb->idx[1][i];
 			needw[node] = 1;
-			for (int k = 0; k < groups->missing[node]->n; k++) {
-				needw[groups->missing[node]->idx[0][k]] = 1;
-			}
+			needw[groups->missing[node]->idx[0][k]] = 1;
 		}
 		GMRFLib_idx_tp *wlist = NULL;
 		for (int i = 0; i < Npred; i++) {
@@ -4222,42 +4210,41 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 		}
 
 #pragma omp parallel for num_threads(gnt) if(gnt > 1) schedule(dynamic, 8)
-		for (int i = 0; i < node_idx->n; i++) {
-			int node = node_idx->idx[i];
-			for (int k = 0; k < groups->missing[node]->n; k++) {
-				int nnode = groups->missing[node]->idx[0][k];
-				int cm_idx = groups->missing[node]->idx[1][k];
-				gsl_matrix *mat = gcpo[cm_idx]->cov_mat;
-				int ii = GMRFLib_iwhich_sorted(node, (int *) gcpo[cm_idx]->idxs->idx, (unsigned int) gcpo[cm_idx]->idxs->n);
-				int jj = GMRFLib_iwhich_sorted(nnode, (int *) gcpo[cm_idx]->idxs->idx, (unsigned int) gcpo[cm_idx]->idxs->n);
-				assert(ii >= 0 && jj >= 0);
-				gsl_matrix_set(mat, ii, ii, lpred_variance[node]);
-				if (jj != ii) {
-					double sum = 0.0;
-					int a = 0, b = 0, na = wnnz[node], nb = wnnz[nnode];
-					int *ia = widx[node], *ib = widx[nnode];
-					double *va = wval[node], *vb = wval[nnode];
-					while (a < na && b < nb) {
-						if (ia[a] == ib[b]) {
-							sum += va[a] * vb[b];
-							a++;
-							b++;
-						} else if (ia[a] < ib[b]) {
-							a++;
-						} else {
-							b++;
-						}
+		for (int i = 0; i < pair_fb->n; i++) {
+			int node = pair_fb->idx[0][i];
+			int k = pair_fb->idx[1][i];
+			int nnode = groups->missing[node]->idx[0][k];
+			int cm_idx = groups->missing[node]->idx[1][k];
+			gsl_matrix *mat = gcpo[cm_idx]->cov_mat;
+			int ii = GMRFLib_iwhich_sorted(node, (int *) gcpo[cm_idx]->idxs->idx, (unsigned int) gcpo[cm_idx]->idxs->n);
+			int jj = GMRFLib_iwhich_sorted(nnode, (int *) gcpo[cm_idx]->idxs->idx, (unsigned int) gcpo[cm_idx]->idxs->n);
+			assert(ii >= 0 && jj >= 0);
+			gsl_matrix_set(mat, ii, ii, lpred_variance[node]);
+			if (jj != ii) {
+				double sum = 0.0;
+				int a = 0, b = 0, na = wnnz[node], nb = wnnz[nnode];
+				int *ia = widx[node], *ib = widx[nnode];
+				double *va = wval[node], *vb = wval[nnode];
+				while (a < na && b < nb) {
+					if (ia[a] == ib[b]) {
+						sum += va[a] * vb[b];
+						a++;
+						b++;
+					} else if (ia[a] < ib[b]) {
+						a++;
+					} else {
+						b++;
 					}
-					for (int cc = 0; cc < nc_gram; cc++) {
-						sum -= mc[(size_t) nnode * nc_gram + cc] * zc[(size_t) node * nc_gram + cc];
-					}
-					double f = sd[node] * sd[nnode];
-					sum /= f;
-					double cov = TRUNCATE(sum, -1.0, 1.0) * f;
-					gsl_matrix_set(mat, jj, jj, lpred_variance[nnode]);
-					gsl_matrix_set(mat, ii, jj, cov);
-					gsl_matrix_set(mat, jj, ii, cov);
 				}
+				for (int cc = 0; cc < nc_gram; cc++) {
+					sum -= mc[(size_t) nnode * nc_gram + cc] * zc[(size_t) node * nc_gram + cc];
+				}
+				double f = sd[node] * sd[nnode];
+				sum /= f;
+				double cov = TRUNCATE(sum, -1.0, 1.0) * f;
+				gsl_matrix_set(mat, jj, jj, lpred_variance[nnode]);
+				gsl_matrix_set(mat, ii, jj, cov);
+				gsl_matrix_set(mat, jj, ii, cov);
 			}
 		}
 
@@ -4266,8 +4253,8 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 			for (int i = 0; i < wlist->n; i++) {
 				wtot += (size_t) wnnz[wlist->idx[i]];
 			}
-			printf("[gcpo-timing] gcpo: GRAM half-solve %.4f s (%1d w-columns, %1d solve-nodes, skip %1d, avg w-nnz %.0f)\n",
-			       GMRFLib_timer() - gcpo_tref, wlist->n, node_idx->n, n_skip, (double) wtot / IMAX(1, wlist->n));
+			printf("[gcpo-timing] gcpo: GRAM half-solve %.4f s (%1d w-columns, %1d fallback-pairs, skip %1d, avg w-nnz %.0f)\n",
+			       GMRFLib_timer() - gcpo_tref, wlist->n, pair_fb->n, n_skip, (double) wtot / IMAX(1, wlist->n));
 		}
 
 		for (int i = 0; i < wlist->n; i++) {
@@ -4391,6 +4378,7 @@ GMRFLib_gcpo_elm_tp **GMRFLib_gcpo(int thread_id, GMRFLib_ai_store_tp *ai_store_
 	}						       /* end of the standard full-solve path */
 
 	GMRFLib_idx_free(node_idx);
+	GMRFLib_idx2_free(pair_fb);
 	Free(skip);
 
 	TIMER_CHECK;
