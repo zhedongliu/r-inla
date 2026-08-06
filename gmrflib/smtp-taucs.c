@@ -18,7 +18,8 @@
 // }
 //      GMRFLib_taucs_ctl_tp;
 
-int GMRFLib_qinv_keep_fill = 0;				       /* see GMRFLib_compute_Qinv_TAUCS_compute() */
+GMRFLib_idx_tp **GMRFLib_qinv_keep_pairs = NULL;	       /* demand-set from gcpo: for latent node i (smaller index), sorted partners */
+int GMRFLib_qinv_keep_pairs_n = 0;
 
 static GMRFLib_taucs_ctl_tp taucs_ctl = {
 	.min_block_size = 4,
@@ -1477,11 +1478,9 @@ int GMRFLib_compute_Qinv_TAUCS_compute(GMRFLib_problem_tp *problem, taucs_ccs_ma
 	}
 
 	// its good to remove as then we do not need to correct that many for constraints.
-	// keeping the fill-entries instead makes the whole L-pattern available to
-	// Qinv_get, which the gcpo lookup-path needs: auto-enabled from ai when gcpo
-	// is on (GMRFLib_qinv_keep_fill), or forced with env INLA_QINV_KEEP_FILL
-	int keep_fill = GMRFLib_qinv_keep_fill || (getenv("INLA_QINV_KEEP_FILL") != NULL);
-	if (!keep_fill) {
+	// fill-entries demanded by the gcpo lookup-path (GMRFLib_qinv_keep_pairs) are
+	// kept so they stay available to Qinv_get
+	{
 		int *rremove = nnbsQ;
 		GMRFLib_ifill(n, 0, rremove);
 		for (int i = 0; i < n; i++) {
@@ -1491,7 +1490,12 @@ int GMRFLib_compute_Qinv_TAUCS_compute(GMRFLib_problem_tp *problem, taucs_ccs_ma
 				int j = Qinv_L[i]->contents[k].key;
 				if (j != i) {
 					int jjj = inv_remap[j];
-					if (!GMRFLib_graph_is_nb(iii, jjj, problem->sub_graph)) {
+					int keep = GMRFLib_graph_is_nb(iii, jjj, problem->sub_graph);
+					if (!keep && GMRFLib_qinv_keep_pairs && IMAX(iii, jjj) < GMRFLib_qinv_keep_pairs_n) {
+						GMRFLib_idx_tp *kp = GMRFLib_qinv_keep_pairs[IMIN(iii, jjj)];
+						keep = (kp && GMRFLib_iwhich_sorted(IMAX(iii, jjj), kp->idx, (unsigned int) kp->n) >= 0);
+					}
+					if (!keep) {
 						rremove[nrremove++] = j;
 					}
 				}

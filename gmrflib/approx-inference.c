@@ -1214,9 +1214,6 @@ int GMRFLib_ai_INLA_experimental(GMRFLib_density_tp ***density,
 	x_mode = Calloc(graph->n, double);
 
 	if (gcpo) {
-		// let the Qinv store keep the L-fill entries so the gcpo lookup-path
-		// can serve pairs beyond the Q-graph neighbours
-		GMRFLib_qinv_keep_fill = 1;
 		(*gcpo) = Calloc(1, GMRFLib_gcpo_tp);
 		(*gcpo)->n = preopt->Npred;
 		(*gcpo)->value = Calloc(preopt->Npred, double);
@@ -3813,6 +3810,59 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		if (groups[node]->n > 0) {
 			GMRFLib_idx2_add(&(missing[node]), node, node);
 		}
+	}
+
+	// build the demand-set of latent index-pairs the gcpo lookup will ask for, so
+	// the Qinv-store keeps exactly those fill-entries and no more: its memory is
+	// then bounded by the group structure, not by the factorization fill. one-time
+	// cost ~ (#pairs x supp^2) appends + sort/uniq
+	if (GMRFLib_smtp == GMRFLib_SMTP_TAUCS) {
+		double kp_tref = GMRFLib_timer();
+		int nlatent = preopt->n;
+		GMRFLib_idx_tp **kp = Calloc(nlatent, GMRFLib_idx_tp *);
+		for (int node = 0; node < Npred; node++) {
+			if (missing[node]->n == 0) {
+				continue;
+			}
+			GMRFLib_idxval_tp *va = A_idx(node);
+			for (int k = 0; k < missing[node]->n; k++) {
+				int nnode = missing[node]->idx[0][k];
+				if (nnode == node) {
+					continue;
+				}
+				GMRFLib_idxval_tp *vb = A_idx(nnode);
+				if ((long) va->n * (long) vb->n > 64L) {
+					// same gate as the lookup: these pairs go to the solver anyway
+					continue;
+				}
+				for (int ka = 0; ka < va->n; ka++) {
+					for (int kb = 0; kb < vb->n; kb++) {
+						int a = va->idx[ka];
+						int b = vb->idx[kb];
+						if (a != b) {
+							GMRFLib_idx_add(&kp[IMIN(a, b)], IMAX(a, b));
+						}
+					}
+				}
+			}
+		}
+		size_t kp_n = 0;
+		for (int i = 0; i < nlatent; i++) {
+			if (kp[i]) {
+				GMRFLib_idx_sort(kp[i]);
+				GMRFLib_idx_uniq(kp[i]);
+				kp_n += (size_t) kp[i]->n;
+			}
+		}
+		GMRFLib_qinv_keep_pairs = kp;
+		GMRFLib_qinv_keep_pairs_n = nlatent;
+		if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
+			printf("[gcpo-timing] build: demand-set %.4f s (%zu latent pairs kept beyond the Q-graph)\n",
+			       GMRFLib_timer() - kp_tref, kp_n);
+		}
+		// the store computed earlier in this function predates the demand-set:
+		// drop it so the configurations recompute it with the pairs kept
+		GMRFLib_free_Qinv(ai_store->problem);
 	}
 
 	// build what to return
