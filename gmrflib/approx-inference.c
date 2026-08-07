@@ -3743,14 +3743,23 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 					GMRFLib_idxval_tp *vb = A_idx(nnode);
 					double sum = 0.0;
 					int hit = 1;
-					for (int ka = 0; ka < va->n && hit; ka++) {
-						for (int kb = 0; kb < vb->n; kb++) {
+					double zs_eps = 1.0E-3 * min_sd / isd[node];
+					for (int kb = 0; kb < vb->n && hit; kb++) {
+						// assemble the latent covariance entry
+						// (Sigma A_node')_b and pass it through the same
+						// zero_small gate as the solve-path, so band-edge
+						// ties resolve identically in both paths
+						double s = 0.0;
+						for (int ka = 0; ka < va->n; ka++) {
 							double *q = GMRFLib_Qinv_get(rb_pb, va->idx[ka], vb->idx[kb]);
 							if (!q) {
 								hit = 0;
 								break;
 							}
-							sum += va->val[ka] * vb->val[kb] * (*q);
+							s += va->val[ka] * (*q);
+						}
+						if (ABS(s) > zs_eps) {
+							sum += vb->val[kb] * s;
 						}
 					}
 					if (hit) {
