@@ -3353,6 +3353,20 @@ static void rb_fsolve_(int n, double *L, double *b)
 	}
 }
 
+// canonical order for truncating a tie level-set at size_max: exact ties carry
+// no information to prefer one member over another, so the fp sort order must
+// not decide membership -- the smallest data indices win, making both build
+// paths and repeated runs select the same subset
+typedef struct {
+	int idx;
+	double val;
+} gcpo_iv_tp_;
+
+static int gcpo_iv_cmp_(const void *a, const void *b)
+{
+	return (((const gcpo_iv_tp_ *) a)->idx - ((const gcpo_iv_tp_ *) b)->idx);
+}
+
 GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *ai_store, GMRFLib_preopt_tp *preopt,
 					   GMRFLib_gcpo_param_tp *gcpo_param, int *UNUSED(fl), GMRFLib_idx_tp *d_idx)
 {
@@ -3959,10 +3973,11 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 				rb_cert_ok = 0;
 			}
 			GMRFLib_idx_tp **fbl = Calloc(nt_outer, GMRFLib_idx_tp *);
-			size_t rb_ok = 0, rb_pmiss = 0, rb_nmiss = 0, rb_certfail = 0;
+			size_t rb_ok = 0, rb_pmiss = 0, rb_nmiss = 0, rb_certfail = 0, rb_ntrunc = 0;
+			int rb_ltrunc = 0;
 			rb_certflag = (build_ab ? Calloc(Npred, char) : NULL);	/* 1=certified, 2=refused (shadow kept) */
 
-#pragma omp parallel for num_threads(nt_outer) schedule(dynamic, 64) reduction(+: rb_ok, rb_pmiss, rb_nmiss, rb_certfail)
+#pragma omp parallel for num_threads(nt_outer) schedule(dynamic, 64) reduction(+: rb_ok, rb_pmiss, rb_nmiss, rb_certfail, rb_ntrunc) reduction(max: rb_ltrunc)
 			for (int is = 0; is < selection->n; is++) {
 				int node = selection->idx[is];
 				int tnum = omp_get_thread_num();
@@ -4035,15 +4050,26 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 						double cor_abs_prev = 1.0;
 						int i_prev = cd->idx[(int) largest[0]];
 						GMRFLib_idxval_add(&(groups[node]), i_prev, cor_abs_prev);
+						// the size_max cap never splits an equal-cor tie by fp sort
+						// order: the level that overflows the cap is still reported
+						// but truncated canonically (all tied members collected, the
+						// smallest data indices win) and deeper levels are dropped.
+						// lvl tracks the level number for the truncation warning.
+						// mirrors the solve copy.
+						int lvl_start = 0, lvl = 1, cut = 0;
 						for (int i = 1; i < siz_g && !levels_ok; i++) {
 							int i_new_l = (int) largest[i];
 							int i_new = cd->idx[i_new_l];
 							double cor_abs_new = cor_abs[i_new_l];
 							if (LEGAL_TO_ADD(i_new)) {
 								if (!GMRFLib_equal_cor(cor_abs_new, cor_abs_prev, gcpo_param)) {
-									if ((sumw >= IABS(gcpo_param->num_level_sets))) {
+									lvl_start = groups[node]->n;
+									if ((sumw >= IABS(gcpo_param->num_level_sets)) ||
+									    (gcpo_param->size_max > 0
+									     && groups[node]->n >= gcpo_param->size_max)) {
 										levels_ok = 1;
 									} else {
+										lvl++;
 										sumw += W(i_new);
 										i_prev = i_new;
 										cor_abs_prev = cor_abs_new;
@@ -4057,13 +4083,47 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 										sumw += W(i_new) - W(i_prev);
 										i_prev = i_new;
 									}
+									if (gcpo_param->size_max > 0 && groups[node]->n > gcpo_param->size_max) {
+										cut = 1;	/* level 'lvl' overflows the cap */
+										levels_ok = 1;
+									}
 								}
 							}
 						}
+						if (cut) {
+							// rebuild the included part of the overflowing level from
+							// ALL tied candidates in index order (one equal_cor pass
+							// over the candidates, independent of the fp sort)
+							int keep = gcpo_param->size_max - lvl_start;
+							int nband = 0;
+							gcpo_iv_tp_ *band = Malloc(ncand, gcpo_iv_tp_);
+							for (int c = 0; c < ncand; c++) {
+								int j = cd->idx[c];
+								if (j != node && LEGAL_TO_ADD(j)
+								    && GMRFLib_equal_cor(cor_abs[c], cor_abs_prev, gcpo_param)) {
+									band[nband].idx = j;
+									band[nband].val = DSIGN(cor[c]) * cor_abs_prev;
+									nband++;
+								}
+							}
+							qsort(band, (size_t) nband, sizeof(gcpo_iv_tp_), gcpo_iv_cmp_);
+							groups[node]->n = lvl_start;
+							if (lvl_start == 0) {
+								// the |cor|=1 band itself overflows: the node keeps
+								// its seat, the rest is filled canonically
+								GMRFLib_idxval_add(&(groups[node]), node, 1.0);
+								keep--;
+							}
+							for (int c = 0; c < IMIN(keep, nband); c++) {
+								GMRFLib_idxval_add(&(groups[node]), band[c].idx, band[c].val);
+							}
+							Free(band);
+							rb_ntrunc++;
+							rb_ltrunc = IMAX(rb_ltrunc, lvl);
+						}
 						v_last = cor_abs_prev;
 						if (!levels_ok) {
-							if ((sumw > IABS(gcpo_param->num_level_sets)) ||
-							    (gcpo_param->size_max > 0 && groups[node]->n >= gcpo_param->size_max)) {
+							if ((sumw > IABS(gcpo_param->num_level_sets))) {
 								levels_ok = 1;
 							} else if (capped) {
 								// would need candidates beyond the radius: cannot conclude
@@ -4175,6 +4235,11 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 				       "(%zu certificate-refused); %zu fill-miss pairs on %zu nodes)\n",
 				       GMRFLib_timer() - rb_tref, rb_ok, selection->n, fb_sel->n, rb_certfail, rb_pmiss, rb_nmiss);
 			}
+			if (rb_ntrunc) {
+				printf("[gcpo] WARNING: size.max=%1d truncated a tie level-set at %zu of %1d nodes (deepest at level %1d); "
+				       "tied members kept by smallest index, deeper levels dropped\n",
+				       gcpo_param->size_max, rb_ntrunc, selection->n, rb_ltrunc);
+			}
 			if (build_ab) {
 				// save the radius groups and let the solve-loop redo ALL nodes
 				groups_rb = Calloc(Npred, GMRFLib_idxval_tp *);
@@ -4201,8 +4266,10 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 
 		int gcpo_timing = (getenv("INLA_GCPO_TIMING") != NULL);
 		double gcpo_tref = (gcpo_timing ? GMRFLib_timer() : 0.0);
+		size_t sg_ntrunc = 0;
+		int sg_ltrunc = 0;
 
-#pragma omp parallel for num_threads(nt_outer)
+#pragma omp parallel for num_threads(nt_outer) reduction(+: sg_ntrunc) reduction(max: sg_ltrunc)
 		for (int kk = 0; kk < (split ? split->n : 0); kk++) {
 			GMRFLib_idx_tp *sel = (GMRFLib_idx_tp *) split->ptr[kk];
 
@@ -4281,21 +4348,31 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 					int i_prev_l = (int) largest[0];
 					int i_prev = d_idx->idx[i_prev_l];
 					GMRFLib_idxval_add(&(groups[node]), i_prev, cor_abs_prev);
+					// the size_max cap never splits an equal-cor tie by fp sort
+					// order: the level that overflows the cap is still reported
+					// but truncated canonically (all tied members collected, the
+					// smallest data indices win) and deeper levels are dropped.
+					// lvl tracks the level number for the truncation warning.
+					// mirrors the radius-lookup copy.
+					int lvl_start = 0, lvl = 1, cut = 0;
 					for (int i = 1; i < siz_g && !levels_ok; i++) {
 						int i_new_l = (int) largest[i];
 						int i_new = d_idx->idx[i_new_l];
 						double cor_abs_new = cor_abs[i_new_l];
 						if (LEGAL_TO_ADD(i_new)) {
 							/*
-							 * we have to go to one more before we stop as we need to add all equal ones first 
+							 * we have to go to one more before we stop as we need to add all equal ones first
 							 */
 							if (!GMRFLib_equal_cor(cor_abs_new, cor_abs_prev, gcpo_param)) {
-								if ((sumw >= IABS(gcpo_param->num_level_sets))) {
+								lvl_start = groups[node]->n;
+								if ((sumw >= IABS(gcpo_param->num_level_sets)) ||
+								    (gcpo_param->size_max > 0 && groups[node]->n >= gcpo_param->size_max)) {
 									/*
-									 * then we will go over if adding, then skip 
+									 * then we will go over if adding, then skip
 									 */
 									levels_ok = 1;
 								} else {
+									lvl++;
 									sumw += W(i_new);
 									i_prev = i_new;
 									cor_abs_prev = cor_abs_new;
@@ -4308,25 +4385,57 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 								GMRFLib_idxval_add(&(groups[node]), i_new, cor[i_new_l]);
 								GMRFLib_DEBUG_id("add to old level  i_new cor_abs_prev", i_new, cor_abs_prev);
 								/*
-								 * use the maximum weight when they are equal 
+								 * use the maximum weight when they are equal
 								 */
 								if (W(i_new) > W(i_prev)) {
 									/*
-									 * correct sumw, reset i_prev to point to the max weight one 
+									 * correct sumw, reset i_prev to point to the max weight one
 									 */
 									sumw += W(i_new) - W(i_prev);
 									i_prev = i_new;
 								}
-							}
-						}
-						if (!levels_ok) {
-							if ((sumw > IABS(gcpo_param->num_level_sets)) ||
-							    (gcpo_param->size_max > 0 && groups[node]->n >= gcpo_param->size_max)) {
-								levels_ok = 1;
+								if (gcpo_param->size_max > 0 && groups[node]->n > gcpo_param->size_max) {
+									cut = 1;	/* level 'lvl' overflows the cap */
+									levels_ok = 1;
+								}
 							}
 						}
 						if (groups[node]->n >= dn)
 							levels_ok = 1;	/* emergency option */
+					}
+					if (cut) {
+						// rebuild the included part of the overflowing level from
+						// ALL tied candidates in index order (one equal_cor pass
+						// over the candidates, independent of the fp sort)
+						int keep = gcpo_param->size_max - lvl_start;
+						int nband = 0;
+						gcpo_iv_tp_ *band = Malloc(dn, gcpo_iv_tp_);
+						for (int c = 0; c < dn; c++) {
+							int j = d_idx->idx[c];
+							if (j != node && LEGAL_TO_ADD(j)
+							    && GMRFLib_equal_cor(cor_abs[c], cor_abs_prev, gcpo_param)) {
+								band[nband].idx = j;
+								band[nband].val = DSIGN(cor[c]) * cor_abs_prev;
+								nband++;
+							}
+						}
+						qsort(band, (size_t) nband, sizeof(gcpo_iv_tp_), gcpo_iv_cmp_);
+						groups[node]->n = lvl_start;
+						if (lvl_start == 0) {
+							// the |cor|=1 band itself overflows: the node keeps
+							// its seat, the rest is filled canonically
+							GMRFLib_idxval_add(&(groups[node]), node, 1.0);
+							keep--;
+						}
+						for (int c = 0; c < IMIN(keep, nband); c++) {
+							GMRFLib_idxval_add(&(groups[node]), band[c].idx, band[c].val);
+						}
+						Free(band);
+						sg_ntrunc++;
+						sg_ltrunc = IMAX(sg_ltrunc, lvl);
+					}
+					if (!levels_ok && (sumw > IABS(gcpo_param->num_level_sets))) {
+						levels_ok = 1;
 					}
 					if (levels_ok) {
 						if (gcpo_param->verbose || detailed_output) {
@@ -4385,6 +4494,11 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		if (gcpo_timing) {
 			printf("[gcpo-timing] build: solve+group loop %.4f s for %1d columns (nrhs %1d, nt_outer %1d)\n",
 			       GMRFLib_timer() - gcpo_tref, solve_sel->n, nrhs, nt_outer);
+		}
+		if (sg_ntrunc) {
+			printf("[gcpo] WARNING: size.max=%1d truncated a tie level-set at %zu of %1d nodes (deepest at level %1d); "
+			       "tied members kept by smallest index, deeper levels dropped\n",
+			       gcpo_param->size_max, sg_ntrunc, solve_sel->n, sg_ltrunc);
 		}
 		if (GMRFLib_smtp == GMRFLib_SMTP_STILES) {
 			// this wil also do unbind
