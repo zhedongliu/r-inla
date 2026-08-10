@@ -3554,15 +3554,33 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		GMRFLib_idx_tp **cand = NULL;
 		GMRFLib_idx_tp **ballI = NULL;		       /* per-node non-hub latent ball (certificate interior) */
 		GMRFLib_idx_tp *rb_hubs = NULL;		       /* the hub latents (global effects) */
+		int cert_radius = 0;
 		if (getenv("INLA_GCPO_BUILD_RADIUS") && GMRFLib_smtp == GMRFLib_SMTP_TAUCS && !(gcpo_param->friends)
 		    && gcpo_param->num_level_sets != -1 && d_idx) {
 			build_radius = atoi(getenv("INLA_GCPO_BUILD_RADIUS"));
+			// the certificate interior may be larger than the candidate/
+			// demand ball: growing it costs only a bigger dense Cholesky
+			// per node (no Sigma lookups, no closure), and tightens the
+			// bound (the conditioned-away boundary moves outward)
+			cert_radius = (getenv("INLA_GCPO_BUILD_CERT_RADIUS") ? atoi(getenv("INLA_GCPO_BUILD_CERT_RADIUS")) : build_radius);
+			cert_radius = IMAX(cert_radius, build_radius);
 		}
 		if (build_radius > 0 && build_ai_store->problem->sub_constr && build_ai_store->problem->sub_constr->nc > 0) {
 			// the separator-certificate does not yet include the
 			// constraint-correction term: refuse rather than risk it
 			if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
 				printf("[gcpo-timing] build: radius-lookup disabled (constrained problem)\n");
+			}
+			build_radius = 0;
+		}
+		if (build_radius > 0 && gcpo_param->any_rankdef) {
+			// unconstrained intrinsic components: the posterior is only
+			// weakly identified, the two build paths' cor values then
+			// differ beyond the equal_cor band and group identity is not
+			// fp-well-defined in ANY implementation -- refuse the fast
+			// path entirely
+			if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
+				printf("[gcpo-timing] build: radius-lookup disabled (rank-deficient component without constraint)\n");
 			}
 			build_radius = 0;
 		}
@@ -3746,11 +3764,37 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 						hi = ns;
 					}
 				}
+				// decoupled certificate interior: extend the ball by extra
+				// non-hub hops that feed ONLY ballI (no candidates, no
+				// demands) -- a tighter bound at zero lookup cost
+				int ns_cand = ns;
+				{
+					int lo2 = 0, hi2 = ns;
+					for (int r = build_radius; r < cert_radius; r++) {
+						for (int t = lo2; t < hi2; t++) {
+							int a = rb_stack[t];
+							if (rb_hub[a]) {
+								continue;
+							}
+							for (int kk = 0; kk < lg->nnbs[a]; kk++) {
+								int b = lg->nbs[a][kk];
+								if (rb_dist[b] < 0) {
+									rb_dist[b] = 2;
+									rb_stack[ns++] = b;
+								}
+							}
+						}
+						lo2 = hi2;
+						hi2 = ns;
+					}
+				}
 				for (int t = 0; t < ns; t++) {
 					int a = rb_stack[t];
-					GMRFLib_idx_tp *tc = touch[a];
-					if (tc && !rb_hub[a]) {
-						GMRFLib_idx_nadd(&(cand[node]), tc->n, tc->idx);
+					if (t < ns_cand) {
+						GMRFLib_idx_tp *tc = touch[a];
+						if (tc && !rb_hub[a]) {
+							GMRFLib_idx_nadd(&(cand[node]), tc->n, tc->idx);
+						}
 					}
 					// the interior of the separator-certificate excludes the
 					// full conditioning set H (rb_cond): Var(eta | rest) is
@@ -4126,8 +4170,19 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 							if ((sumw > IABS(gcpo_param->num_level_sets))) {
 								levels_ok = 1;
 							} else if (capped) {
-								// would need candidates beyond the radius: cannot conclude
-								exhausted = 1;
+								if (sumw >= IABS(gcpo_param->num_level_sets)) {
+									// all level-sets found among the candidates;
+									// only the band-completion witness is missing.
+									// the certificate below proves no outside node
+									// reaches or ties the deepest band, which is
+									// exactly that witness -- conclude instead of
+									// falling back
+									levels_ok = 1;
+								} else {
+									// fewer levels than requested exist locally:
+									// cannot conclude
+									exhausted = 1;
+								}
 							}
 						}
 					}

@@ -806,6 +806,11 @@ typedef struct {
 	int *idx_start;
 	int *idx_n;
 	char **idx_tag;
+
+	// any latent component with declared rank-deficiency (intrinsic
+	// models): without constraints the posterior is only weakly
+	// identified and the radius-lookup fast path must refuse
+	int any_rankdef;
 } GMRFLib_gcpo_param_tp;
 
 typedef struct {

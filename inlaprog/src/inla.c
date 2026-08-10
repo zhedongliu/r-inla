@@ -647,6 +647,12 @@ inla_tp *inla_build(const char *dict_filename, int verbose)
 		mb->gcpo_param->idx_tag = mb->idx_tag;
 		mb->gcpo_param->idx_start = mb->idx_start;
 		mb->gcpo_param->idx_n = mb->idx_n;
+		mb->gcpo_param->any_rankdef = 0;
+		for (i = 0; i < mb->nf; i++) {
+			if (mb->f_rankdef[i] > 0.0) {
+				mb->gcpo_param->any_rankdef = 1;
+			}
+		}
 	}
 
 	/*
