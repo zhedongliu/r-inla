@@ -3613,7 +3613,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			//           all latents of any model component with dim <= 64
 			//           (the vb_nodes philosophy: fixed effects and small
 			//           components are 'few global effects').
-			int rb_exp_lim = IMAX(1024, d_idx->n / 4);
+			int rb_exp_lim = IMAX(64, d_idx->n / 4);
 			int rb_cond_lim = IMAX(64, d_idx->n / 100);
 			char *rb_hub = Calloc(nlatent, char);
 			char *rb_cond = Calloc(nlatent, char);
@@ -4201,7 +4201,13 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 						// (Markov: conditioning on the ball complement separates).
 						int cert_ok = 0;
 						GMRFLib_idx_tp *bi = ballI[node];
-						if (rb_cert_ok && bi && bi->n > 0 && bi->n <= 1024) {
+						if (rb_cert_ok && ncand >= d_idx->n && node_miss == 0) {
+							// complete information: every data node is a candidate
+							// and every pair was exact, so the selection already saw
+							// everything the solve path would see -- there is no
+							// 'outside' left to certify against
+							cert_ok = 1;
+						} else if (rb_cert_ok && bi && bi->n > 0 && bi->n <= 256) {
 							int nb = bi->n;
 							double *QII = Calloc((size_t) nb * nb, double);
 							double *aI = Calloc(nb, double);
