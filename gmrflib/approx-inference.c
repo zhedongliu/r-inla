@@ -3768,25 +3768,23 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 				// non-hub hops that feed ONLY ballI (no candidates, no
 				// demands) -- a tighter bound at zero lookup cost
 				int ns_cand = ns;
-				{
-					int lo2 = 0, hi2 = ns;
-					for (int r = build_radius; r < cert_radius; r++) {
-						for (int t = lo2; t < hi2; t++) {
-							int a = rb_stack[t];
-							if (rb_hub[a]) {
-								continue;
-							}
-							for (int kk = 0; kk < lg->nnbs[a]; kk++) {
-								int b = lg->nbs[a][kk];
-								if (rb_dist[b] < 0) {
-									rb_dist[b] = 2;
-									rb_stack[ns++] = b;
-								}
+				int lo2 = 0, hi2 = ns;
+				for (int r = build_radius; r < cert_radius; r++) {
+					for (int t = lo2; t < hi2; t++) {
+						int a = rb_stack[t];
+						if (rb_hub[a]) {
+							continue;
+						}
+						for (int kk = 0; kk < lg->nnbs[a]; kk++) {
+							int b = lg->nbs[a][kk];
+							if (rb_dist[b] < 0) {
+								rb_dist[b] = 2;
+								rb_stack[ns++] = b;
 							}
 						}
-						lo2 = hi2;
-						hi2 = ns;
 					}
+					lo2 = hi2;
+					hi2 = ns;
 				}
 				for (int t = 0; t < ns; t++) {
 					int a = rb_stack[t];
@@ -4150,7 +4148,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 									nband++;
 								}
 							}
-							qsort(band, (size_t) nband, sizeof(gcpo_iv_tp_), gcpo_iv_cmp_);
+							QSORT_FUN(band, (size_t) nband, sizeof(gcpo_iv_tp_), gcpo_iv_cmp_);
 							groups[node]->n = lvl_start;
 							if (lvl_start == 0) {
 								// the |cor|=1 band itself overflows: the node keeps
@@ -4480,7 +4478,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 								nband++;
 							}
 						}
-						qsort(band, (size_t) nband, sizeof(gcpo_iv_tp_), gcpo_iv_cmp_);
+						QSORT_FUN(band, (size_t) nband, sizeof(gcpo_iv_tp_), gcpo_iv_cmp_);
 						groups[node]->n = lvl_start;
 						if (lvl_start == 0) {
 							// the |cor|=1 band itself overflows: the node keeps
