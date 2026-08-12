@@ -3399,8 +3399,13 @@ typedef struct {
 // returns 1 iff the walk exhausted its component: visited\cond is closed in the
 // graph minus cond, i.e. H seals the core off ('separator equality': every
 // non-candidate correlation is then EXACTLY the hub part, no bound needed)
+// min_ball/min_cand are two-sided growth targets (0 = off, legacy reach): keep
+// growing past grow_radius until the interior holds min_ball latents AND the
+// lifted proposal is estimated to hold min_cand data nodes. the retry rounds
+// pass the previous sizes doubled, so the climb is geometric and self-paced
+// (predictor-side aware): no step tuning needed, the certificate arbitrates
 static int rb_grow_node_(rb_ctx_tp_ *c, int node, int grow_radius, int cert_extra, int topk, int kcap,
-			 GMRFLib_idx_tp **cand, GMRFLib_idx_tp **ballI)
+			 int min_ball, int min_cand, GMRFLib_idx_tp **cand, GMRFLib_idx_tp **ballI)
 {
 	GMRFLib_graph_tp *lg = c->lg;
 	GMRFLib_idxval_tp *va = c->Aidx[node];
@@ -3427,8 +3432,9 @@ static int rb_grow_node_(rb_ctx_tp_ *c, int node, int grow_radius, int cert_extr
 	}
 	if (topk > 0 && c->wts) {
 		// truncated multi-source Dijkstra in the strength metric;
-		// collects the topk strongest-path non-hub latents
-		int ntl = 0, nonhub = 0;
+		// collects the topk strongest-path non-hub latents (and keeps
+		// settling past topk while the proposal target is unmet)
+		int ntl = 0, nonhub = 0, ncest = 0;
 		for (int t = 0; t < ns; t++) {
 			int a = c->stack[t];
 			c->ddist[a] = 0.0;
@@ -3446,8 +3452,14 @@ static int rb_grow_node_(rb_ctx_tp_ *c, int node, int grow_radius, int cert_extr
 			c->tl[tmin] = c->tl[--ntl];
 			c->dist[a] = 1;
 			c->stack[ns++] = a;
-			if (!c->hub[a] && ++nonhub >= topk) {
-				break;
+			if (!c->hub[a]) {
+				nonhub++;
+				if (c->touch[a]) {
+					ncest += c->touch[a]->n;
+				}
+				if (nonhub >= kcap || (nonhub >= topk && nonhub >= min_ball && ncest >= min_cand)) {
+					break;
+				}
 			}
 			if (c->hub[a]) {
 				continue;	       /* settles, but does not expand */
@@ -3471,15 +3483,22 @@ static int rb_grow_node_(rb_ctx_tp_ *c, int node, int grow_radius, int cert_extr
 			c->dist[c->tl[t]] = -1;	       /* clear tentative leftovers */
 		}
 	} else {
-		int lo = 0, hi = ns;
-		for (int r = 1; r <= grow_radius; r++) {
-			int nb = 0;
-			for (int t = 0; t < ns; t++) {
-				nb += !c->cond[c->stack[t]];
+		int lo = 0, hi = ns, nball = 0, ncest = 0;
+		for (int t = 0; t < ns; t++) {
+			int a = c->stack[t];
+			nball += !c->cond[a];
+			if (!c->hub[a] && c->touch[a]) {
+				ncest += c->touch[a]->n;
 			}
-			if (nb >= kcap) {
+		}
+		for (int r = 1; r <= c->nlatent; r++) {
+			if (r > grow_radius && nball >= min_ball && ncest >= min_cand) {
+				break;
+			}
+			if (nball >= kcap) {
 				break;		       /* interior budget reached */
 			}
+			int added = 0;
 			for (int t = lo; t < hi; t++) {
 				int a = c->stack[t];
 				if (c->hub[a]) {
@@ -3490,8 +3509,16 @@ static int rb_grow_node_(rb_ctx_tp_ *c, int node, int grow_radius, int cert_extr
 					if (c->dist[b] < 0) {
 						c->dist[b] = r;
 						c->stack[ns++] = b;
+						nball += !c->cond[b];
+						if (!c->hub[b] && c->touch[b]) {
+							ncest += c->touch[b]->n;
+						}
+						added++;
 					}
 				}
+			}
+			if (!added) {
+				break;		       /* component exhausted */
 			}
 			lo = hi;
 			hi = ns;
@@ -3969,7 +3996,8 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			rb_sep = Calloc(Npred, char);
 			for (int k = 0; k < d_idx->n; k++) {
 				rb_sep[d_idx->idx[k]] =
-				    (char) rb_grow_node_(&rbc, d_idx->idx[k], build_radius, cert_radius - build_radius, rb_topk, nlatent, cand, ballI);
+				    (char) rb_grow_node_(&rbc, d_idx->idx[k], build_radius, cert_radius - build_radius, rb_topk, nlatent,
+							 0, 0, cand, ballI);
 			}
 			for (int i = 0; i < nlatent; i++) {
 				if (rb_kp[i]) {
@@ -4164,8 +4192,10 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			// from the new K, demands appended, the Qinv fill recomputed
 			// with the union) and is retried; a regrown interior is
 			// truncated at RB_KCAP so a retried node always fits the
-			// certificate. the walk step per round is RETRY_STEP rings
-			// (strength-proposal: topk doubles per round instead)
+			// certificate. the reach is self-paced: each round doubles
+			// the sizes the failed round achieved (two-sided targets in
+			// rb_grow_node_), with RETRY_STEP rings per round as the
+			// floor (strength-proposal: topk doubles per round as well)
 			int rb_rounds = (getenv("INLA_GCPO_BUILD_ROUNDS") ? IMAX(1, atoi(getenv("INLA_GCPO_BUILD_ROUNDS"))) : 1);
 			int rb_step = (getenv("INLA_GCPO_BUILD_RETRY_STEP") ? IMAX(1, atoi(getenv("INLA_GCPO_BUILD_RETRY_STEP"))) : 1);
 			size_t rb_ntrunc = 0;
@@ -4178,10 +4208,15 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 					}
 					double rt_ref = GMRFLib_timer();
 					for (int is = 0; is < fb_sel->n; is++) {
+						int nd = fb_sel->idx[is];
 						int tk = (rb_topk > 0 ? IMIN(rb_topk << round, RB_KCAP) : 0);
-						rb_sep[fb_sel->idx[is]] =
-						    (char) rb_grow_node_(&rbc, fb_sel->idx[is], build_radius + round * rb_step,
-									 cert_radius - build_radius, tk, RB_KCAP, cand, ballI);
+						// self-paced climb: double the sizes the failed
+						// round achieved, on both sides of the lift
+						int mb = IMIN(2 * (ballI[nd] ? ballI[nd]->n : 1), RB_KCAP);
+						int mc = IMIN(2 * (cand[nd] ? cand[nd]->n : 1), d_idx->n);
+						rb_sep[nd] =
+						    (char) rb_grow_node_(&rbc, nd, build_radius + round * rb_step,
+									 cert_radius - build_radius, tk, RB_KCAP, mb, mc, cand, ballI);
 					}
 					for (int i = 0; i < rbc.nlatent; i++) {
 						if (rbc.kp[i]) {
