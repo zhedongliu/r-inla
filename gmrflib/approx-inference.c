@@ -3392,6 +3392,8 @@ typedef struct {
 	GMRFLib_idxval_tp **Aidx;		       /* drop: data-node -> A-support */
 	GMRFLib_idx_tp **kp;			       /* demanded Qinv pairs (smaller latent -> partners) */
 	int check;				       /* verify lift(K) subset-of proposal per node */
+	char *ctouch;				       /* latents in a constraint support: a straddling constraint
+						        * re-couples the separated sides, no separator equality */
 } rb_ctx_tp_;
 
 // returns 1 iff the walk exhausted its component: visited\cond is closed in the
@@ -3544,6 +3546,10 @@ static int rb_grow_node_(rb_ctx_tp_ *c, int node, int grow_radius, int cert_extr
 		int a = c->stack[t];
 		if (c->cond[a]) {
 			continue;
+		}
+		if (c->ctouch && c->ctouch[a]) {
+			closed = 0;
+			break;
 		}
 		for (int kk = 0; kk < lg->nnbs[a]; kk++) {
 			int b = lg->nbs[a][kk];
@@ -3798,7 +3804,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		GMRFLib_idx_tp *rb_hubs = NULL;		       /* the hub latents (global effects) */
 		int cert_radius = 0;
 		int rb_topk = 0;
-		rb_ctx_tp_ rbc = { NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0 };
+		rb_ctx_tp_ rbc = { NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL };
 		char *rb_sep = NULL;			       /* per-node: walk exhausted its component (separator equality) */
 		double *rb_ldg = NULL;			       /* latent hub-loadings zeta_k = L^{-1} Sigma_{H,k} */
 		double *rb_udg = NULL;			       /* per-data-node hub-loadings u_i = L^{-1} c_H(eta_i) */
@@ -3812,14 +3818,12 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			cert_radius = (getenv("INLA_GCPO_BUILD_CERT_RADIUS") ? atoi(getenv("INLA_GCPO_BUILD_CERT_RADIUS")) : build_radius);
 			cert_radius = IMAX(cert_radius, build_radius);
 		}
-		if (build_radius > 0 && build_ai_store->problem->sub_constr && build_ai_store->problem->sub_constr->nc > 0) {
-			// the separator-certificate does not yet include the
-			// constraint-correction term: refuse rather than risk it
-			if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
-				printf("[gcpo-timing] build: radius-lookup disabled (constrained problem)\n");
-			}
-			build_radius = 0;
-		}
+		// constrained problems are supported: GMRFLib_Qsolves and
+		// GMRFLib_compute_Qinv both apply the constraint correction, so the
+		// hub columns, the candidate correlations and the sds are already
+		// constrained; the certificate conditions on the active constraints
+		// locally (constrained-locality lemma), and the separator equality
+		// is disabled for components touched by a constraint
 		if (build_radius > 0 && gcpo_param->any_rankdef) {
 			// unconstrained intrinsic components: the posterior is only
 			// weakly identified, the two build paths' cor values then
@@ -3947,6 +3951,19 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			rbc.Aidx = A_idx_ptr();
 			rbc.kp = rb_kp;
 			rbc.check = (getenv("INLA_GCPO_BUILD_CHECK") != NULL || getenv("INLA_GCPO_BUILD_AB") != NULL);
+			if (build_ai_store->problem->sub_constr && build_ai_store->problem->sub_constr->nc > 0) {
+				GMRFLib_constr_tp *rcn = build_ai_store->problem->sub_constr;
+				rbc.ctouch = Calloc(nlatent, char);
+				for (int cc = 0; cc < rcn->nc; cc++) {
+					int jlo = (rcn->jfirst ? rcn->jfirst[cc] : 0);
+					int jhi = (rcn->jlen ? jlo + rcn->jlen[cc] : nlatent);
+					for (int j = jlo; j < jhi; j++) {
+						if (rcn->a_matrix[cc + (size_t) j * rcn->nc] != 0.0) {
+							rbc.ctouch[j] = 1;
+						}
+					}
+				}
+			}
 			// round-1 growth: no interior cap (kcap = nlatent), exactly the
 			// legacy reach; retry rounds regrow refused nodes with RB_KCAP
 			rb_sep = Calloc(Npred, char);
@@ -4426,13 +4443,71 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 									for (int r = 0; r < nb; r++) {
 										vc += aI[r] * aI[r];
 									}
+									// constrained problems ('constrained locality'): given x_F the
+									// active constraints reduce to A_K x_K, so their explained part
+									// must be conditioned away on the same local factor:
+									//   vc <- vc - w' (A_K Q_KK^{-1} A_K')^{-1} w,  w = A_K Q_KK^{-1} a_K.
+									// inactive rows (A_K-part zero) are constants given x_F and drop
+									// out; dependent active rows refuse the node (fallback, safe).
+									// soft constraints: this overcorrects, hence is conservative
+									GMRFLib_constr_tp *rcn = rb_pb->sub_constr;
+									int cfail = 0;
+									if (rcn && rcn->nc > 0) {
+										int ncr = rcn->nc, nact = 0;
+										double *G = Malloc((size_t) ncr * nb + ncr + (size_t) ncr * ncr, double);
+										double *w = G + (size_t) ncr * nb;
+										double *M = w + ncr;
+										for (int cc = 0; cc < ncr; cc++) {
+											double *g = G + (size_t) nact * nb;
+											int nz = 0;
+											for (int r = 0; r < nb; r++) {
+												g[r] = rcn->a_matrix[cc + (size_t) bi->idx[r] * ncr];
+												nz += (g[r] != 0.0);
+											}
+											if (nz) {
+												rb_fsolve_(nb, QII, g);
+												nact++;
+											}
+										}
+										for (int c1 = 0; c1 < nact; c1++) {
+											double s = 0.0;
+											for (int r = 0; r < nb; r++) {
+												s += G[(size_t) c1 * nb + r] * aI[r];
+											}
+											w[c1] = s;
+											for (int c2 = 0; c2 <= c1; c2++) {
+												double m = 0.0;
+												for (int r = 0; r < nb; r++) {
+													m += G[(size_t) c1 * nb + r] * G[(size_t) c2 * nb + r];
+												}
+												M[c1 * nact + c2] = M[c2 * nact + c1] = m;
+											}
+										}
+										if (nact > 0) {
+											if (rb_chol_(nact, M)) {
+												cfail = 1;
+											} else {
+												rb_fsolve_(nact, M, w);
+												double vcorr = 0.0;
+												for (int c1 = 0; c1 < nact; c1++) {
+													vcorr += w[c1] * w[c1];
+												}
+												vc = DMAX(0.0, vc - vcorr);
+											}
+										}
+										Free(G);
+									}
 									double vareta = 1.0 / (isd[node] * isd[node]);
 									double rh = (rhoH ? rhoH[node] : 0.0);
 									double varh = vareta * (1.0 - rh * rh);
 									double r2f = (varh > 0.0 ? 1.0 - vc / varh : 1.0);
 									r2f = TRUNCATE(r2f, 0.0, 1.0);
 									double bnd = rh * rhoH_max + sqrt(1.0 - rh * rh) * sqrt(r2f);
-									cert_ok = (bnd < v_last) && !GMRFLib_equal_cor(bnd, v_last, gcpo_param);
+									if (getenv("INLA_GCPO_BUILD_DEBUG") && is < 8) {
+										printf("[gcpo-dbg] node %1d ncand %1d nb %1d rh %.4f rhmax %.4f vc %.6g varh %.6g r2f %.4f bnd %.4f vlast %.4f\n",
+										       node, ncand, nb, rh, rhoH_max, vc, varh, r2f, bnd, v_last);
+									}
+									cert_ok = !cfail && (bnd < v_last) && !GMRFLib_equal_cor(bnd, v_last, gcpo_param);
 									// fp-margin guard: near the |cor|=1 pile-up the
 									// equal_cor band (abs halfwidth ~ eps(1-v^2)/2)
 									// gets narrower than the fp agreement of two
@@ -4821,6 +4896,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			Free(rb_sep);
 			Free(rb_ldg);
 			Free(rb_udg);
+			Free(rbc.ctouch);
 			// the growth state, kept alive for the retry rounds.
 			// rbc.kp is NOT freed: it is owned by the global
 			// GMRFLib_qinv_keep_pairs since the install above
