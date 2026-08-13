@@ -3822,8 +3822,10 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 		// further knobs: INLA_GCPO_BUILD_CERT_RADIUS=R>r grows the certificate
 		// interior (and, invariantly, the proposal) by extra rings;
 		// INLA_GCPO_BUILD_TOPK=K>0 grows by strength-Dijkstra instead of hop-BFS;
-		// INLA_GCPO_BUILD_ROUNDS=n>1 retries refused nodes with a regrown, larger
-		// walk (step INLA_GCPO_BUILD_RETRY_STEP rings per round, default 1);
+		// INLA_GCPO_BUILD_ROUNDS=n retries refused nodes with a regrown, larger
+		// walk (default 4 rounds; converged or saturated retries stop early, so
+		// unused rounds are free; step INLA_GCPO_BUILD_RETRY_STEP rings per
+		// round, default 1);
 		// INLA_GCPO_BUILD_CHECK=1 verifies lift(K) subset-of proposal per node.
 		int build_radius = 0;
 		GMRFLib_idx_tp **cand = NULL;
@@ -4196,17 +4198,32 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 			// the sizes the failed round achieved (two-sided targets in
 			// rb_grow_node_), with RETRY_STEP rings per round as the
 			// floor (strength-proposal: topk doubles per round as well)
-			int rb_rounds = (getenv("INLA_GCPO_BUILD_ROUNDS") ? IMAX(1, atoi(getenv("INLA_GCPO_BUILD_ROUNDS"))) : 1);
+			int rb_rounds = (getenv("INLA_GCPO_BUILD_ROUNDS") ? IMAX(1, atoi(getenv("INLA_GCPO_BUILD_ROUNDS"))) : 4);
 			int rb_step = (getenv("INLA_GCPO_BUILD_RETRY_STEP") ? IMAX(1, atoi(getenv("INLA_GCPO_BUILD_RETRY_STEP"))) : 1);
 			size_t rb_ntrunc = 0;
 			int rb_ltrunc = 0;
 			GMRFLib_idx_tp *round_sel = selection;
+			GMRFLib_idx_tp *perm_sel = NULL;	       /* refusals no retry can lift */
 			for (int round = 0; round < rb_rounds; round++) {
 				if (round > 0) {
 					if (!rb_cert_ok || !fb_sel || fb_sel->n == 0) {
 						break;
 					}
+					// retry economics: the refill is a full Takahashi recompute
+					// (fixed cost, independent of how few nodes regrow), while
+					// falling a small tail back costs per-column only -- retrying
+					// pays exactly when the failed set is bulk, and every observed
+					// bulk case fails with >= 99% of the data nodes.  a small tail
+					// (< 1/8) goes to the solve-fallback instead
+					if ((size_t) fb_sel->n * 8 < (size_t) d_idx->n) {
+						if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
+							printf("[gcpo-timing] build: retry-round %1d skipped (%1d nodes, a tail), to solve-fallback\n",
+							       round, fb_sel->n);
+						}
+						break;
+					}
 					double rt_ref = GMRFLib_timer();
+					size_t rb_sz_before = 0, rb_sz_after = 0;
 					for (int is = 0; is < fb_sel->n; is++) {
 						int nd = fb_sel->idx[is];
 						int tk = (rb_topk > 0 ? IMIN(rb_topk << round, RB_KCAP) : 0);
@@ -4214,9 +4231,22 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 						// round achieved, on both sides of the lift
 						int mb = IMIN(2 * (ballI[nd] ? ballI[nd]->n : 1), RB_KCAP);
 						int mc = IMIN(2 * (cand[nd] ? cand[nd]->n : 1), d_idx->n);
+						rb_sz_before += (ballI[nd] ? ballI[nd]->n : 0) + (cand[nd] ? cand[nd]->n : 0);
 						rb_sep[nd] =
 						    (char) rb_grow_node_(&rbc, nd, build_radius + round * rb_step,
 									 cert_radius - build_radius, tk, RB_KCAP, mb, mc, cand, ballI);
+						rb_sz_after += (ballI[nd] ? ballI[nd]->n : 0) + (cand[nd] ? cand[nd]->n : 0);
+					}
+					if (rb_sz_after == rb_sz_before) {
+						// every walk is saturated (interior at its cap, candidates
+						// exhausted): the retry inputs cannot change anymore, so
+						// further rounds just repeat the refusal -- stop here and
+						// leave fb_sel to the solve-fallback
+						if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
+							printf("[gcpo-timing] build: retry-round %1d saturated (%1d nodes), stop\n",
+							       round, fb_sel->n);
+						}
+						break;
 					}
 					for (int i = 0; i < rbc.nlatent; i++) {
 						if (rbc.kp[i]) {
@@ -4238,9 +4268,10 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 				}
 				double rb_tref = GMRFLib_timer();
 				GMRFLib_idx_tp **fbl = Calloc(nt_outer, GMRFLib_idx_tp *);
-				size_t rb_ok = 0, rb_pmiss = 0, rb_nmiss = 0, rb_certfail = 0, rb_sepn = 0;
+				GMRFLib_idx_tp **pfl = Calloc(nt_outer, GMRFLib_idx_tp *);	/* permanent refusals */
+				size_t rb_ok = 0, rb_pmiss = 0, rb_nmiss = 0, rb_certfail = 0, rb_sepn = 0, rb_permfail = 0;
 
-#pragma omp parallel for num_threads(nt_outer) schedule(dynamic, 64) reduction(+: rb_ok, rb_pmiss, rb_nmiss, rb_certfail, rb_sepn, rb_ntrunc) reduction(max: rb_ltrunc)
+#pragma omp parallel for num_threads(nt_outer) schedule(dynamic, 64) reduction(+: rb_ok, rb_pmiss, rb_nmiss, rb_certfail, rb_sepn, rb_ntrunc, rb_permfail) reduction(max: rb_ltrunc)
 				for (int is = 0; is < round_sel->n; is++) {
 					int node = round_sel->idx[is];
 					int tnum = omp_get_thread_num();
@@ -4322,6 +4353,7 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 					rb_pmiss += node_miss;
 					rb_nmiss += (node_miss > 0);
 
+					int cert_perm = 0;	       /* refusal no retry can lift */
 					if (ok) {
 						int levels_ok = 0, exhausted = 0;
 						double levels_magnify = 1.0;
@@ -4549,8 +4581,16 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 									// exact-in-theory computation paths; group
 									// identity is then not fp-well-defined in ANY
 									// implementation, so refuse and inherit the
-									// original path verbatim
-									cert_ok = cert_ok && (0.5 * gcpo_param->epsilon * (1.0 - v_last * v_last) > 1.0e-9);
+									// original path verbatim.  this refusal is
+									// PERMANENT: v_last (the nls-th distinct level
+									// value) can only grow as candidates are added
+									// (num.level.sets=1 has v_last = 1 always), so
+									// no regrown walk can pass the guard -- route
+									// straight to the solve-fallback, never retry
+									if (0.5 * gcpo_param->epsilon * (1.0 - v_last * v_last) <= 1.0e-9) {
+										cert_ok = 0;
+										cert_perm = 1;
+									}
 								}
 								Free(QII);
 								Free(aI);
@@ -4576,7 +4616,12 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 						if (groups[node] && !(rb_certflag && rb_certflag[node] == 2)) {
 							groups[node]->n = 0;
 						}
-						GMRFLib_idx_add(&(fbl[tnum]), node);
+						if (cert_perm) {
+							rb_permfail++;
+							GMRFLib_idx_add(&(pfl[tnum]), node);
+						} else {
+							GMRFLib_idx_add(&(fbl[tnum]), node);
+						}
 					}
 					Free(cor);
 					Free(largest);
@@ -4587,21 +4632,30 @@ GMRFLib_gcpo_groups_tp *GMRFLib_gcpo_build(int thread_id, GMRFLib_ai_store_tp *a
 						GMRFLib_idx_nadd(&fb_sel, fbl[t]->n, fbl[t]->idx);
 						GMRFLib_idx_free(fbl[t]);
 					}
+					if (pfl[t]) {
+						GMRFLib_idx_nadd(&perm_sel, pfl[t]->n, pfl[t]->idx);
+						GMRFLib_idx_free(pfl[t]);
+					}
 				}
 				Free(fbl);
+				Free(pfl);
 				if (!fb_sel) {
 					GMRFLib_idx_create_x(&fb_sel, 1);	/* empty */
 				}
 				if (gcpo_param->verbose || getenv("INLA_GCPO_TIMING")) {
 					printf("[gcpo-timing] build: round-%1d radius-lookup groups %.4f s (%zu of %1d certified (%zu analytic), %1d to %s "
-					       "(%zu certificate-refused); %zu fill-miss pairs on %zu nodes)\n",
+					       "(%zu certificate-refused, %zu permanently); %zu fill-miss pairs on %zu nodes)\n",
 					       round, GMRFLib_timer() - rb_tref, rb_ok, round_sel->n, rb_sepn, fb_sel->n,
 					       (round + 1 < rb_rounds && rb_cert_ok && fb_sel->n > 0 ? "retry" : "solve-fallback"),
-					       rb_certfail, rb_pmiss, rb_nmiss);
+					       rb_certfail, rb_permfail, rb_pmiss, rb_nmiss);
 				}
 			}
 			if (round_sel != selection) {
 				GMRFLib_idx_free(round_sel);
+			}
+			if (perm_sel) {
+				GMRFLib_idx_nadd(&fb_sel, perm_sel->n, perm_sel->idx);
+				GMRFLib_idx_free(perm_sel);
 			}
 			solve_sel = fb_sel;
 			if (rb_ntrunc) {
